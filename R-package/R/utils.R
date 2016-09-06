@@ -213,6 +213,15 @@ generate.cv.folds <- function(nfold, nrows, stratified, label, params) {
   return(folds)
 }
 
+## choose optimal number of trees based on cv results
+xgb.cv.optimal <- function(x, auc = TRUE) {
+  regx <- grepl("^test(.*)mean$", names(x))
+    if (sum(regx) != 1) {
+      stop("[xgb.cv.optimal] the cv column is not uniquely identified", call. = FALSE)
+    }
+  if (auc) which.max(x[[which(regx)]]) else which.min(x[[which(regx)]])
+}
+
 # Creates CV folds stratified by the values of y.
 # It was borrowed from caret::createFolds and simplified
 # by always returning an unnamed list of fold indices.

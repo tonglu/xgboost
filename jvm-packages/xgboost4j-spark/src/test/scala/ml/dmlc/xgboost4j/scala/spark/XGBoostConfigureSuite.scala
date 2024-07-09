@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014 by Contributors
+ Copyright (c) 2014-2022 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -16,45 +16,66 @@
 
 package ml.dmlc.xgboost4j.scala.spark
 
-import ml.dmlc.xgboost4j.java.{DMatrix => JDMatrix}
 import ml.dmlc.xgboost4j.scala.{Booster, DMatrix}
-import org.apache.spark.{SparkConf, SparkContext}
-import org.scalatest.FunSuite
 
-class XGBoostConfigureSuite extends FunSuite with Utils {
+import org.apache.spark.sql._
+import org.scalatest.funsuite.AnyFunSuite
 
-  test("nthread configuration must be equal to spark.task.cpus") {
-    val sparkConf = new SparkConf().setMaster("local[*]").setAppName("XGBoostSuite").
-      set("spark.task.cpus", "4")
-    val customSparkContext = new SparkContext(sparkConf)
-    customSparkContext.setLogLevel("ERROR")
-    // start another app
-    val trainingRDD = buildTrainingRDD(customSparkContext)
-    val paramMap = Map("eta" -> "1", "max_depth" -> "2", "silent" -> "1",
-      "objective" -> "binary:logistic", "nthread" -> 6)
+class XGBoostConfigureSuite extends AnyFunSuite with PerTest {
+
+  override def sparkSessionBuilder: SparkSession.Builder = super.sparkSessionBuilder
+      .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+      .config("spark.kryo.classesToRegister", classOf[Booster].getName)
+
+  test("nthread configuration must be no larger than spark.task.cpus") {
+    val training = buildDataFrame(Classification.train)
+    val paramMap = Map("eta" -> "1", "max_depth" -> "2", "verbosity" -> "1",
+      "objective" -> "binary:logistic", "num_workers" -> numWorkers,
+      "nthread" -> (sc.getConf.getInt("spark.task.cpus", 1) + 1))
     intercept[IllegalArgumentException] {
-      XGBoost.trainWithRDD(trainingRDD, paramMap, 5, numWorkers)
+      new XGBoostClassifier(paramMap ++ Seq("num_round" -> 2)).fit(training)
     }
-    customSparkContext.stop()
   }
 
   test("kryoSerializer test") {
-    labeledPointsRDD = null
+    // TODO write an isolated test for Booster.
+    val training = buildDataFrame(Classification.train)
+    val testDM = new DMatrix(Classification.test.iterator, null)
+    val paramMap = Map("eta" -> "1", "max_depth" -> "2", "verbosity" -> "1",
+      "objective" -> "binary:logistic", "num_round" -> 5, "num_workers" -> numWorkers)
+
+    val model = new XGBoostClassifier(paramMap).fit(training)
     val eval = new EvalError()
-    val sparkConf = new SparkConf().setMaster("local[*]").setAppName("XGBoostSuite")
-      .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-    sparkConf.registerKryoClasses(Array(classOf[Booster]))
-    val customSparkContext = new SparkContext(sparkConf)
-    customSparkContext.setLogLevel("ERROR")
-    val trainingRDD = buildTrainingRDD(customSparkContext)
-    val testSet = loadLabelPoints(getClass.getResource("/agaricus.txt.test").getFile).iterator
-    import DataUtils._
-    val testSetDMatrix = new DMatrix(new JDMatrix(testSet, null))
-    val paramMap = Map("eta" -> "1", "max_depth" -> "2", "silent" -> "1",
-      "objective" -> "binary:logistic")
-    val xgBoostModel = XGBoost.trainWithRDD(trainingRDD, paramMap, 5, numWorkers)
-    assert(eval.eval(xgBoostModel.booster.predict(testSetDMatrix, outPutMargin = true),
-      testSetDMatrix) < 0.1)
-    customSparkContext.stop()
+    assert(eval.eval(model._booster.predict(testDM, outPutMargin = true), testDM) < 0.1)
+  }
+
+  test("Check for Spark encryption over-the-wire") {
+    val originalSslConfOpt = ss.conf.getOption("spark.ssl.enabled")
+    ss.conf.set("spark.ssl.enabled", true)
+
+    val paramMap = Map("eta" -> "1", "max_depth" -> "2", "verbosity" -> "1",
+      "objective" -> "binary:logistic", "num_round" -> 2, "num_workers" -> numWorkers)
+    val training = buildDataFrame(Classification.train)
+
+    withClue("xgboost-spark should throw an exception when spark.ssl.enabled = true but " +
+      "xgboost.spark.ignoreSsl != true") {
+      val thrown = intercept[Exception] {
+        new XGBoostClassifier(paramMap).fit(training)
+      }
+      assert(thrown.getMessage.contains("xgboost.spark.ignoreSsl") &&
+        thrown.getMessage.contains("spark.ssl.enabled"))
+    }
+
+    // Confirm that this check can be overridden.
+    ss.conf.set("xgboost.spark.ignoreSsl", true)
+    new XGBoostClassifier(paramMap).fit(training)
+
+    originalSslConfOpt match {
+      case None =>
+        ss.conf.unset("spark.ssl.enabled")
+      case Some(originalSslConf) =>
+        ss.conf.set("spark.ssl.enabled", originalSslConf)
+    }
+    ss.conf.unset("xgboost.spark.ignoreSsl")
   }
 }

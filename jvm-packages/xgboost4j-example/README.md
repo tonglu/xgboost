@@ -10,6 +10,7 @@ XGBoost4J Code Examples
 * [Cross validation](src/main/java/ml/dmlc/xgboost4j/java/example/CrossValidation.java)
 * [Predicting leaf indices](src/main/java/ml/dmlc/xgboost4j/java/example/PredictLeafIndices.java)
 * [External Memory](src/main/java/ml/dmlc/xgboost4j/java/example/ExternalMemory.java)
+* [Early Stopping](src/main/java/ml/dmlc/xgboost4j/java/example/EarlyStopping.java)
 
 ## Scala API
 
@@ -23,7 +24,7 @@ XGBoost4J Code Examples
 * [External Memory](src/main/scala/ml/dmlc/xgboost4j/scala/example/ExternalMemory.scala)
 
 ## Spark API
-* [Distributed Training with Spark](src/main/scala/ml/dmlc/xgboost4j/scala/example/spark/DistTrainWithSpark.scala)
+* [Distributed Training with Spark](src/main/scala/ml/dmlc/xgboost4j/scala/example/spark/SparkMLlibPipeline.scala)
 
 ## Flink API
 * [Distributed Training with Flink](src/main/scala/ml/dmlc/xgboost4j/scala/example/flink/DistTrainWithFlink.scala)

@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014 by Contributors
+ Copyright (c) 2014-2022 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -16,8 +16,6 @@
 
 package ml.dmlc.xgboost4j.scala
 
-import java.io.IOException
-
 import com.esotericsoftware.kryo.io.{Output, Input}
 import com.esotericsoftware.kryo.{Kryo, KryoSerializable}
 import ml.dmlc.xgboost4j.java.{Booster => JBooster}
@@ -25,8 +23,56 @@ import ml.dmlc.xgboost4j.java.XGBoostError
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 
-class Booster private[xgboost4j](private var booster: JBooster)
+/**
+  * Booster for xgboost, this is a model API that support interactive build of a XGBoost Model
+  *
+  * DEVELOPER WARNING: A Java Booster must not be shared by more than one Scala Booster
+  * @param booster the java booster object.
+  */
+class Booster private[xgboost4j](private[xgboost4j] var booster: JBooster)
   extends Serializable  with KryoSerializable {
+
+  /**
+   * Get attributes stored in the Booster as a Map.
+   *
+   * @return A map contain attribute pairs.
+   */
+  @throws(classOf[XGBoostError])
+  def getAttrs: Map[String, String] = {
+    booster.getAttrs.asScala.toMap
+  }
+
+  /**
+   * Get attribute from the Booster.
+   *
+   * @param key   attr name
+   * @return attr value
+   */
+  @throws(classOf[XGBoostError])
+  def getAttr(key: String): String = {
+    booster.getAttr(key)
+  }
+
+  /**
+   * Set attribute to the Booster.
+   *
+   * @param key   attr name
+   * @param value attr value
+   */
+  @throws(classOf[XGBoostError])
+  def setAttr(key: String, value: String): Unit = {
+    booster.setAttr(key, value)
+  }
+
+  /**
+   * set attributes
+   *
+   * @param params attributes key-value map
+   */
+  @throws(classOf[XGBoostError])
+  def setAttrs(params: Map[String, String]): Unit = {
+    booster.setAttrs(params.asJava)
+  }
 
   /**
     * Set parameter to the Booster.
@@ -60,27 +106,41 @@ class Booster private[xgboost4j](private var booster: JBooster)
     booster.update(dtrain.jDMatrix, iter)
   }
 
+  @throws(classOf[XGBoostError])
+  @deprecated
+  def update(dtrain: DMatrix, obj: ObjectiveTrait): Unit = {
+    booster.update(dtrain.jDMatrix, obj)
+  }
+
   /**
    * update with customize obj func
    *
    * @param dtrain training data
+   * @param iter   The current training iteration
    * @param obj    customized objective class
    */
   @throws(classOf[XGBoostError])
-  def update(dtrain: DMatrix, obj: ObjectiveTrait): Unit = {
-    booster.update(dtrain.jDMatrix, obj)
+  def update(dtrain: DMatrix, iter: Int, obj: ObjectiveTrait): Unit = {
+    booster.update(dtrain.jDMatrix, iter, obj)
+  }
+
+  @throws(classOf[XGBoostError])
+  @deprecated
+  def boost(dtrain: DMatrix, grad: Array[Float], hess: Array[Float]): Unit = {
+    booster.boost(dtrain.jDMatrix, grad, hess)
   }
 
   /**
    * update with give grad and hess
    *
    * @param dtrain training data
+   * @param iter   The current training iteration
    * @param grad   first order of gradient
    * @param hess   seconde order of gradient
    */
   @throws(classOf[XGBoostError])
-  def boost(dtrain: DMatrix, grad: Array[Float], hess: Array[Float]): Unit = {
-    booster.boost(dtrain.jDMatrix, grad, hess)
+  def boost(dtrain: DMatrix, iter: Int, grad: Array[Float], hess: Array[Float]): Unit = {
+    booster.boost(dtrain.jDMatrix, iter, grad, hess)
   }
 
   /**
@@ -121,8 +181,8 @@ class Booster private[xgboost4j](private var booster: JBooster)
    * @return predict result
    */
   @throws(classOf[XGBoostError])
-  def predict(data: DMatrix, outPutMargin: Boolean = false, treeLimit: Int = 0)
-      : Array[Array[Float]] = {
+  def predict(data: DMatrix, outPutMargin: Boolean = false, treeLimit: Int = 0):
+      Array[Array[Float]] = {
     booster.predict(data.jDMatrix, outPutMargin, treeLimit)
   }
 
@@ -135,9 +195,21 @@ class Booster private[xgboost4j](private var booster: JBooster)
    * @throws XGBoostError native error
    */
   @throws(classOf[XGBoostError])
-  def predictLeaf(data: DMatrix, treeLimit: Int = 0)
-    : Array[Array[Float]] = {
+  def predictLeaf(data: DMatrix, treeLimit: Int = 0): Array[Array[Float]] = {
     booster.predictLeaf(data.jDMatrix, treeLimit)
+  }
+
+  /**
+    * Output feature contributions toward predictions of given data
+    *
+    * @param data      dmatrix storing the input
+    * @param treeLimit Limit number of trees in the prediction; defaults to 0 (use all trees).
+    * @return The feature contributions and bias.
+    * @throws XGBoostError native error
+    */
+  @throws(classOf[XGBoostError])
+  def predictContrib(data: DMatrix, treeLimit: Int = 0) : Array[Array[Float]] = {
+    booster.predictContrib(data.jDMatrix, treeLimit)
   }
 
   /**
@@ -149,6 +221,7 @@ class Booster private[xgboost4j](private var booster: JBooster)
   def saveModel(modelPath: String): Unit = {
     booster.saveModel(modelPath)
   }
+
   /**
     * save model to Output stream
     *
@@ -158,6 +231,18 @@ class Booster private[xgboost4j](private var booster: JBooster)
   def saveModel(out: java.io.OutputStream): Unit = {
     booster.saveModel(out)
   }
+
+  /**
+   * save model to Output stream
+   * @param out output stream
+   * @param format the supported model format, (json, ubj, deprecated)
+   * @throws ml.dmlc.xgboost4j.java.XGBoostError
+   */
+  @throws(classOf[XGBoostError])
+  def saveModel(out: java.io.OutputStream, format: String): Unit = {
+    booster.saveModel(out, format)
+  }
+
   /**
    * Dump model as Array of string
    *
@@ -166,23 +251,97 @@ class Booster private[xgboost4j](private var booster: JBooster)
    *                   Controls whether the split statistics are output.
    */
   @throws(classOf[XGBoostError])
-  def getModelDump(featureMap: String = null, withStats: Boolean = false)
+  def getModelDump(featureMap: String = null, withStats: Boolean = false, format: String = "text")
     : Array[String] = {
-    booster.getModelDump(featureMap, withStats)
+    booster.getModelDump(featureMap, withStats, format)
   }
 
   /**
-   * Get importance of each feature
+    * Dump model as Array of string with specified feature names.
+    *
+    * @param featureNames Names of features.
+    */
+  @throws(classOf[XGBoostError])
+  def getModelDump(featureNames: Array[String]): Array[String] = {
+    booster.getModelDump(featureNames, false, "text")
+  }
+
+  def getModelDump(featureNames: Array[String], withStats: Boolean, format: String)
+    : Array[String] = {
+    booster.getModelDump(featureNames, withStats, format)
+  }
+
+
+  /**
+   * Get importance of each feature based on weight only (number of splits)
    *
-   * @return featureMap  key: feature index, value: feature importance score
+   * @return featureScoreMap  key: feature index, value: feature importance score
    */
   @throws(classOf[XGBoostError])
   def getFeatureScore(featureMap: String = null): mutable.Map[String, Integer] = {
     booster.getFeatureScore(featureMap).asScala
   }
 
+  /**
+    * Get importance of each feature based on weight only
+    * (number of splits), with specified feature names.
+    *
+    * @return featureScoreMap  key: feature name, value: feature importance score
+    */
+  @throws(classOf[XGBoostError])
+  def getFeatureScore(featureNames: Array[String]): mutable.Map[String, Integer] = {
+    booster.getFeatureScore(featureNames).asScala
+  }
+
+  /**
+    * Get importance of each feature based on information gain or cover
+    * Supported: ["gain, "cover", "total_gain", "total_cover"]
+    *
+    * @return featureScoreMap  key: feature index, value: feature importance score
+    */
+  @throws(classOf[XGBoostError])
+  def getScore(featureMap: String, importanceType: String): Map[String, Double] = {
+    Map(booster.getScore(featureMap, importanceType)
+        .asScala.mapValues(_.doubleValue).toSeq: _*)
+  }
+
+  /**
+    * Get importance of each feature based on information gain or cover
+    * , with specified feature names.
+    * Supported: ["gain, "cover", "total_gain", "total_cover"]
+    *
+    * @return featureScoreMap  key: feature name, value: feature importance score
+    */
+  @throws(classOf[XGBoostError])
+  def getScore(featureNames: Array[String], importanceType: String): Map[String, Double] = {
+    Map(booster.getScore(featureNames, importanceType)
+        .asScala.mapValues(_.doubleValue).toSeq: _*)
+  }
+
+  /**
+    * Get the number of model features.
+    *
+    * @return number of features
+    */
+  @throws(classOf[XGBoostError])
+  def getNumFeature: Long = booster.getNumFeature
+
+  def getNumBoostedRound: Long = booster.getNumBoostedRound
+
+  /**
+    * Save model into a raw byte array.  Available options are "json", "ubj" and "deprecated".
+    */
+  @throws(classOf[XGBoostError])
+  def toByteArray(format: String): Array[Byte] = {
+    booster.toByteArray(format)
+  }
+
+  /**
+    * Save model into a raw byte array in the UBJSON ("ubj") format.
+    */
+  @throws(classOf[XGBoostError])
   def toByteArray: Array[Byte] = {
-    booster.toByteArray
+    booster.toByteArray()
   }
 
   /**

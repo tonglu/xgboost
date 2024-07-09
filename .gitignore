@@ -15,10 +15,9 @@
 *.Rcheck
 *.rds
 *.tar.gz
-*txt*
 *conf
 *buffer
-*model
+*.model
 *pyc
 *.train
 *.test
@@ -47,13 +46,16 @@ Debug
 *.cpage.col
 *.cpage
 *.Rproj
-./xgboost
 ./xgboost.mpi
 ./xgboost.mock
+*.bak
 #.Rbuildignore
 R-package.Rproj
 *.cache*
-#java
+.mypy_cache/
+doxygen
+
+# java
 java/xgboost4j/target
 java/xgboost4j/tmp
 java/xgboost4j-demo/target
@@ -64,19 +66,90 @@ nb-configuration*
 # Eclipse
 .project
 .cproject
+.classpath
 .pydevproject
 .settings/
 build
-config.mk
-xgboost
+/xgboost
 *.data
 build_plugin
 .idea
 recommonmark/
 tags
-*.iml
+TAGS
 *.class
 target
 *.swp
 
+# cpp tests and gcov generated files
+*.gcov
+*.gcda
+*.gcno
+build_tests
+/tests/cpp/xgboost_test
+
 .DS_Store
+lib/
+
+# spark
+metastore_db
+
+/include/xgboost/build_config.h
+
+# files from R-package source install
+**/config.status
+R-package/src/Makevars
+*.lib
+
+# Visual Studio
+.vs/
+CMakeSettings.json
+*.ilk
+*.pdb
+
+# IntelliJ/CLion
+.idea
+*.iml
+/cmake-build-debug/
+
+# GDB
+.gdb_history
+
+# Python joblib.Memory used in pytest.
+cachedir/
+
+# Files from local Dask work
+dask-worker-space/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# credentials and key material
+config
+credentials
+credentials.csv
+*.env
+*.pem
+*.pub
+*.rdp
+*_rsa
+
+# Visual Studio code + extensions
+.vscode
+.metals
+.bloop
+
+# python tests
+demo/**/*.txt
+*.dmatrix
+.hypothesis
+__MACOSX/
+model*.json
+
+# R tests
+*.htm
+*.html
+*.libsvm
+*.rds
+Rplots.pdf
+*.zip

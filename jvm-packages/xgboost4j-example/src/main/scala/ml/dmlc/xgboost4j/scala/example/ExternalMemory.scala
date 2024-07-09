@@ -20,13 +20,13 @@ import scala.collection.mutable
 
 import ml.dmlc.xgboost4j.scala.{XGBoost, DMatrix}
 
-class ExternalMemory {
+object ExternalMemory {
   def main(args: Array[String]): Unit = {
     // this is the only difference, add a # followed by a cache prefix name
     // several cache file with the prefix will be generated
     // currently only support convert from libsvm file
-    val trainMat = new DMatrix("../../demo/data/agaricus.txt.train#dtrain.cache")
-    val testMat = new DMatrix("../../demo/data/agaricus.txt.test#dtest.cache")
+    val trainMat = new DMatrix("../../demo/data/agaricus.txt.train?format=libsvm#dtrain.cache")
+    val testMat = new DMatrix("../../demo/data/agaricus.txt.test?format=libsvm#dtest.cache")
 
     val params = new mutable.HashMap[String, Any]()
     params += "eta" -> 1.0
@@ -54,6 +54,6 @@ class ExternalMemory {
     testMat.setBaseMargin(testPred)
 
     System.out.println("result of running from initial prediction")
-    val booster2 = XGBoost.train(trainMat, params.toMap, 1, watches.toMap, null, null)
+    val booster2 = XGBoost.train(trainMat, params.toMap, 1, watches.toMap)
   }
 }

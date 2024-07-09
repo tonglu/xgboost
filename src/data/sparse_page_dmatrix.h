@@ -1,131 +1,164 @@
-/*!
- * Copyright 2015 by Contributors
- * \file simple_dmatrix.h
- * \brief In-memory version of DMatrix.
+/**
+ * Copyright 2015-2024, XGBoost Contributors
+ * \file sparse_page_dmatrix.h
+ * \brief External-memory version of DMatrix.
  * \author Tianqi Chen
  */
 #ifndef XGBOOST_DATA_SPARSE_PAGE_DMATRIX_H_
 #define XGBOOST_DATA_SPARSE_PAGE_DMATRIX_H_
 
-#include <xgboost/base.h>
-#include <xgboost/data.h>
-#include <dmlc/threadediter.h>
-#include <vector>
-#include <algorithm>
-#include <string>
-#include "./sparse_batch_page.h"
-#include "../common/common.h"
+#include <cstdint>  // for uint32_t, int32_t
+#include <map>      // for map
+#include <memory>   // for shared_ptr
+#include <sstream>  // for stringstream
+#include <string>   // for string
+#include <variant>  // for variant, visit
 
-namespace xgboost {
-namespace data {
+#include "ellpack_page_source.h"         // for EllpackPageSource, EllpackPageHostSource
+#include "gradient_index_page_source.h"  // for GradientIndexPageSource
+#include "sparse_page_source.h"          // for SparsePageSource, Cache
+#include "xgboost/context.h"             // for Context
+#include "xgboost/data.h"                // for DMatrix, MetaInfo
+#include "xgboost/logging.h"
+#include "xgboost/span.h"  // for Span
 
+namespace xgboost::data {
+/**
+ * @brief DMatrix used for external memory.
+ *
+ * The external memory is created for controlling memory usage by splitting up data into
+ * multiple batches.  However that doesn't mean we will actually process exactly 1 batch
+ * at a time, which would be terribly slow considering that we have to loop through the
+ * whole dataset for every tree split.  So we use async to pre-fetch pages and let the
+ * caller to decide how many batches it wants to process by returning data as a shared
+ * pointer. The caller can use async function to process the data or just stage those
+ * batches based on its use cases. These two optimizations might defeat the purpose of
+ * splitting up dataset since if you stage all the batches then the memory usage might be
+ * even worse than using a single batch. As a result, we must control how many batches can
+ * be in memory at any given time.
+ *
+ * Right now the write to the cache is a sequential operation and is blocking. Reading
+ * from cache on ther other hand, is async but with a hard coded limit of 3 pages as an
+ * heuristic.  So by sparse dmatrix itself there can be only 7 pages in main memory (might
+ * be of different types) at the same time: 1 page pending for write, 3 pre-fetched sparse
+ * pages, 3 pre-fetched dependent pages.
+ *
+ * Of course if the caller decides to retain some batches to perform parallel processing,
+ * then we might load all pages in memory, which is also considered as a bug in caller's
+ * code. So if the algo supports external memory, it must be careful that queue for async
+ * call must have an upper limit.
+ *
+ * Another assumption we make is that the data must be immutable so caller should never
+ * change the data.  Sparse page source returns const page to make sure of that.  If you
+ * want to change the generated page like Ellpack, pass parameter into `GetBatches` to
+ * re-generate them instead of trying to modify the pages in-place.
+ *
+ * The overall chain of responsibility of external memory DMatrix:
+ *
+ *    User defined iterator (in Python/C/R) -> Proxy DMatrix -> Sparse page Source ->
+ *    Other sources (Like Ellpack) -> Sparse Page DMatrix -> Caller
+ *
+ * A possible optimization is skipping the sparse page source for `hist` based algorithms
+ * similar to the Quantile DMatrix.
+ */
 class SparsePageDMatrix : public DMatrix {
+  MetaInfo info_;
+  BatchParam batch_param_;
+  std::map<std::string, std::shared_ptr<Cache>> cache_info_;
+
+  DMatrixHandle proxy_;
+  DataIterHandle iter_;
+  DataIterResetCallback *reset_;
+  XGDMatrixCallbackNext *next_;
+
+  float missing_;
+  Context fmat_ctx_;
+  std::string cache_prefix_;
+  bool on_host_{false};
+  std::uint32_t n_batches_{0};
+  // sparse page is the source to other page types, we make a special member function.
+  void InitializeSparsePage(Context const *ctx);
+  // Non-virtual version that can be used in constructor
+  BatchSet<SparsePage> GetRowBatchesImpl(Context const *ctx);
+
  public:
-  explicit SparsePageDMatrix(std::unique_ptr<DataSource>&& source,
-                             const std::string& cache_info)
-      : source_(std::move(source)), cache_info_(cache_info) {
+  explicit SparsePageDMatrix(DataIterHandle iter, DMatrixHandle proxy, DataIterResetCallback *reset,
+                             XGDMatrixCallbackNext *next, float missing, int32_t nthreads,
+                             std::string cache_prefix, bool on_host = false);
+
+  ~SparsePageDMatrix() override;
+
+  [[nodiscard]] MetaInfo &Info() override;
+  [[nodiscard]] const MetaInfo &Info() const override;
+  [[nodiscard]] Context const *Ctx() const override { return &fmat_ctx_; }
+  // The only DMatrix implementation that returns false.
+  [[nodiscard]] bool SingleColBlock() const override { return false; }
+  DMatrix *Slice(common::Span<std::int32_t const>) override {
+    LOG(FATAL) << "Slicing DMatrix is not supported for external memory.";
+    return nullptr;
+  }
+  DMatrix *SliceCol(int, int) override {
+    LOG(FATAL) << "Slicing DMatrix columns is not supported for external memory.";
+    return nullptr;
   }
 
-  MetaInfo& info() override {
-    return source_->info;
+  [[nodiscard]] bool EllpackExists() const override {
+    return std::visit([](auto &&ptr) { return static_cast<bool>(ptr); }, ellpack_page_source_);
   }
-
-  const MetaInfo& info() const override {
-    return source_->info;
+  [[nodiscard]] bool GHistIndexExists() const override {
+    return static_cast<bool>(ghist_index_source_);
   }
-
-  dmlc::DataIter<RowBatch>* RowIterator() override {
-    dmlc::DataIter<RowBatch>* iter = source_.get();
-    iter->BeforeFirst();
-    return iter;
+  [[nodiscard]] bool SparsePageExists() const override {
+    return static_cast<bool>(sparse_page_source_);
   }
-
-  bool HaveColAccess() const override {
-    return col_iter_.get() != nullptr;
+  // For testing, getter for the number of fetches for sparse page source.
+  [[nodiscard]] auto SparsePageFetchCount() const {
+    return this->sparse_page_source_->FetchCount();
   }
-
-  const RowSet& buffered_rowset() const override {
-    return buffered_rowset_;
-  }
-
-  size_t GetColSize(size_t cidx) const {
-    return col_size_[cidx];
-  }
-
-  float GetColDensity(size_t cidx) const override {
-    size_t nmiss = buffered_rowset_.size() - col_size_[cidx];
-    return 1.0f - (static_cast<float>(nmiss)) / buffered_rowset_.size();
-  }
-
-  bool SingleColBlock() const override {
-    return false;
-  }
-
-  dmlc::DataIter<ColBatch>* ColIterator() override;
-
-  dmlc::DataIter<ColBatch>* ColIterator(const std::vector<bst_uint>& fset) override;
-
-  void InitColAccess(const std::vector<bool>& enabled,
-                     float subsample,
-                     size_t max_row_perbatch) override;
-
-  /*! \brief page size 256 MB */
-  static const size_t kPageSize = 256UL << 20UL;
-  /*! \brief Maximum number of rows per batch. */
-  static const size_t kMaxRowPerBatch = 64UL << 10UL;
 
  private:
-  // declare the column batch iter.
-  class ColPageIter : public dmlc::DataIter<ColBatch> {
-   public:
-    explicit ColPageIter(std::vector<std::unique_ptr<dmlc::SeekStream> >&& files);
-    virtual ~ColPageIter();
-    void BeforeFirst() override;
-    const ColBatch &Value() const override {
-      return out_;
-    }
-    bool Next() override;
-    // initialize the column iterator with the specified index set.
-    void Init(const std::vector<bst_uint>& index_set, bool load_all);
+  BatchSet<SparsePage> GetRowBatches() override;
+  BatchSet<CSCPage> GetColumnBatches(Context const *ctx) override;
+  BatchSet<SortedCSCPage> GetSortedColumnBatches(Context const *ctx) override;
+  BatchSet<EllpackPage> GetEllpackBatches(Context const *ctx, const BatchParam &param) override;
+  BatchSet<GHistIndexMatrix> GetGradientIndex(Context const *ctx, const BatchParam &) override;
+  BatchSet<ExtSparsePage> GetExtBatches(Context const *, BatchParam const &) override {
+    LOG(FATAL) << "Can not obtain a single CSR page for external memory DMatrix";
+    return BatchSet<ExtSparsePage>(BatchIterator<ExtSparsePage>(nullptr));
+  }
 
-   private:
-    // the temp page.
-    SparsePage* page_;
-    // internal clock ptr.
-    size_t clock_ptr_;
-    // data file pointer.
-    std::vector<std::unique_ptr<dmlc::SeekStream> > files_;
-    // page format.
-    std::vector<std::unique_ptr<SparsePage::Format> > formats_;
-    /*! \brief internal prefetcher. */
-    std::vector<std::unique_ptr<dmlc::ThreadedIter<SparsePage> > > prefetchers_;
-    // The index set to be loaded.
-    std::vector<bst_uint> index_set_;
-    // The index set by the outsiders
-    std::vector<bst_uint> set_index_set_;
-    // whether to load data dataset.
-    bool set_load_all_, load_all_;
-    // temporal space for batch
-    ColBatch out_;
-    // the pointer data.
-    std::vector<SparseBatch::Inst> col_data_;
-  };
-  /*!
-   * \brief Try to intitialize column data.
-   * \return true if data already exists, false if they do not.
-   */
-  bool TryInitColData();
-  // source data pointer.
-  std::unique_ptr<DataSource> source_;
-  // the cache prefix
-  std::string cache_info_;
-  /*! \brief list of row index that are buffered */
-  RowSet buffered_rowset_;
-  // count for column data
-  std::vector<size_t> col_size_;
-  // internal column iter.
-  std::unique_ptr<ColPageIter> col_iter_;
+ private:
+  // source data pointers.
+  std::shared_ptr<SparsePageSource> sparse_page_source_;
+  using EllpackDiskPtr = std::shared_ptr<EllpackPageSource>;
+  using EllpackHostPtr = std::shared_ptr<EllpackPageHostSource>;
+  std::variant<EllpackDiskPtr, EllpackHostPtr> ellpack_page_source_;
+  std::shared_ptr<CSCPageSource> column_source_;
+  std::shared_ptr<SortedCSCPageSource> sorted_column_source_;
+  std::shared_ptr<GradientIndexPageSource> ghist_index_source_;
 };
-}  // namespace data
-}  // namespace xgboost
+
+[[nodiscard]] inline std::string MakeId(std::string prefix, SparsePageDMatrix *ptr) {
+  std::stringstream ss;
+  ss << ptr;
+  return prefix + "-" + ss.str();
+}
+
+/**
+ * @brief Make cache if it doesn't exist yet.
+ */
+inline std::string MakeCache(SparsePageDMatrix *ptr, std::string format, bool on_host,
+                             std::string prefix,
+                             std::map<std::string, std::shared_ptr<Cache>> *out) {
+  auto &cache_info = *out;
+  auto name = MakeId(prefix, ptr);
+  auto id = name + format;
+  auto it = cache_info.find(id);
+  if (it == cache_info.cend()) {
+    cache_info[id].reset(new Cache{false, name, format, on_host});
+    LOG(INFO) << "Make cache:" << cache_info[id]->ShardName();
+  }
+  return id;
+}
+}  // namespace xgboost::data
 #endif  // XGBOOST_DATA_SPARSE_PAGE_DMATRIX_H_

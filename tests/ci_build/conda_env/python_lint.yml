@@ -1,0 +1,22 @@
+name: python_lint
+channels:
+- conda-forge
+dependencies:
+- python=3.8
+- pylint<3.2.4  # https://github.com/pylint-dev/pylint/issues/9751
+- wheel
+- setuptools
+- mypy>=0.981
+- numpy
+- scipy
+- pandas
+- scikit-learn
+- dask
+- distributed
+- black
+- isort
+- cloudpickle
+- pytest
+- hypothesis
+- hatchling
+- pyspark>=3.4.0

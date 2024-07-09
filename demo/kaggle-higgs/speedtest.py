@@ -1,9 +1,12 @@
 #!/usr/bin/python
 # this is the example script to use xgboost to train
-import numpy as np
-import xgboost as xgb
-from sklearn.ensemble import GradientBoostingClassifier
 import time
+
+import numpy as np
+from sklearn.ensemble import GradientBoostingClassifier
+
+import xgboost as xgb
+
 test_size = 550000
 
 # path to where the data lies
@@ -36,13 +39,12 @@ param['scale_pos_weight'] = sum_wneg/sum_wpos
 param['bst:eta'] = 0.1
 param['bst:max_depth'] = 6
 param['eval_metric'] = 'auc'
-param['silent'] = 1
 param['nthread'] = 4
 
 plst = param.items()+[('eval_metric', 'ams@0.15')]
 
 watchlist = [ (xgmat,'train') ]
-# boost 10 tres
+# boost 10 trees
 num_round = 10
 print ('loading data end, start to boost trees')
 print ("training GBM from sklearn")

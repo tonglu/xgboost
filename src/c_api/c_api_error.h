@@ -1,5 +1,5 @@
-/*!
- *  Copyright (c) 2015 by Contributors
+/**
+ *  Copyright 2015-2023, XGBoost Contributors
  * \file c_api_error.h
  * \brief Error handling for C API.
  */
@@ -8,19 +8,36 @@
 
 #include <dmlc/base.h>
 #include <dmlc/logging.h>
-#include <xgboost/c_api.h>
+
+#include "c_api_utils.h"
+#include "xgboost/collective/result.h"
 
 /*! \brief  macro to guard beginning and end section of all functions */
-#define API_BEGIN() try {
+#ifdef LOG_CAPI_INVOCATION
+#define API_BEGIN()                                                            \
+  LOG(CONSOLE) << "[XGBoost C API invocation] " << __PRETTY_FUNCTION__;        \
+  try {                                                                        \
+    auto __guard = ::xgboost::XGBoostAPIGuard();
+#else  // LOG_CAPI_INVOCATION
+#define API_BEGIN()                                                            \
+  try {                                                                        \
+    auto __guard = ::xgboost::XGBoostAPIGuard();
+
+#define API_BEGIN_UNGUARD() try {
+#endif  // LOG_CAPI_INVOCATION
+
 /*! \brief every function starts with API_BEGIN();
-     and finishes with API_END() or API_END_HANDLE_ERROR */
-#define API_END() } catch(dmlc::Error &_except_) { return XGBAPIHandleException(_except_); } return 0;  // NOLINT(*)
-/*!
- * \brief every function starts with API_BEGIN();
- *   and finishes with API_END() or API_END_HANDLE_ERROR
- *   The finally clause contains procedure to cleanup states when an error happens.
- */
-#define API_END_HANDLE_ERROR(Finalize) } catch(dmlc::Error &_except_) { Finalize; return XGBAPIHandleException(_except_); } return 0; // NOLINT(*)
+     and finishes with API_END() */
+#define API_END()                                                              \
+  } catch (dmlc::Error & _except_) {                                           \
+    return XGBAPIHandleException(_except_);                                    \
+  } catch (std::exception const& _except_) {                                   \
+    return XGBAPIHandleException(dmlc::Error(_except_.what()));                \
+  }                                                                            \
+  return 0; // NOLINT(*)
+
+#define CHECK_HANDLE() \
+  if (handle == nullptr) ::xgboost::detail::EmptyHandle();
 
 /*!
  * \brief Set the last error message needed by C API
@@ -28,12 +45,20 @@
  */
 void XGBAPISetLastError(const char* msg);
 /*!
- * \brief handle exception throwed out
+ * \brief handle exception thrown out
  * \param e the exception
  * \return the return value of API after exception is handled
  */
-inline int XGBAPIHandleException(const dmlc::Error &e) {
+inline int XGBAPIHandleException(const dmlc::Error& e) {
   XGBAPISetLastError(e.what());
   return -1;
 }
+
+#define xgboost_CHECK_C_ARG_PTR(out_ptr)                      \
+  do {                                                        \
+    if (XGBOOST_EXPECT(!(out_ptr), false)) {                  \
+      LOG(FATAL) << "Invalid pointer argument: " << #out_ptr; \
+    }                                                         \
+  } while (0)
+
 #endif  // XGBOOST_C_API_C_API_ERROR_H_

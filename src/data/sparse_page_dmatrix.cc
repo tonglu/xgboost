@@ -1,303 +1,224 @@
-/*!
- * Copyright 2014 by Contributors
+/**
+ * Copyright 2014-2023 by XGBoost Contributors
  * \file sparse_page_dmatrix.cc
+ *
  * \brief The external memory version of Page Iterator.
  * \author Tianqi Chen
  */
-#include <dmlc/base.h>
-#include <dmlc/timer.h>
-#include <xgboost/logging.h>
-#include <memory>
-
-#if DMLC_ENABLE_STD_THREAD
 #include "./sparse_page_dmatrix.h"
-#include "../common/random.h"
-#include "../common/common.h"
-#include "../common/group_data.h"
 
-namespace xgboost {
-namespace data {
+#include "../collective/communicator-inl.h"
+#include "batch_utils.h"  // for RegenGHist
+#include "gradient_index.h"
 
-SparsePageDMatrix::ColPageIter::ColPageIter(
-    std::vector<std::unique_ptr<dmlc::SeekStream> >&& files)
-    : page_(nullptr), clock_ptr_(0), files_(std::move(files)) {
-  load_all_ = false;
-  formats_.resize(files_.size());
-  prefetchers_.resize(files_.size());
+namespace xgboost::data {
+MetaInfo &SparsePageDMatrix::Info() { return info_; }
 
-  for (size_t i = 0; i < files_.size(); ++i) {
-    dmlc::SeekStream* fi = files_[i].get();
-    std::string format;
-    CHECK(fi->Read(&format)) << "Invalid page format";
-    formats_[i].reset(SparsePage::Format::Create(format));
-    SparsePage::Format* fmt = formats_[i].get();
-    size_t fbegin = fi->Tell();
-    prefetchers_[i].reset(new dmlc::ThreadedIter<SparsePage>(4));
-    prefetchers_[i]->Init([this, fi, fmt] (SparsePage** dptr) {
-        if (*dptr == nullptr) {
-          *dptr = new SparsePage();
-        }
-        if (load_all_) {
-          return fmt->Read(*dptr, fi);
-        } else {
-          return fmt->Read(*dptr, fi, index_set_);
-        }
-      },  [this, fi, fbegin] () {
-        fi->Seek(fbegin);
-        index_set_ = set_index_set_;
-        load_all_ = set_load_all_;
-      });
-  }
+const MetaInfo &SparsePageDMatrix::Info() const { return info_; }
+
+namespace detail {
+// Use device dispatch
+std::size_t NSamplesDevice(DMatrixProxy *)  // NOLINT
+#if defined(XGBOOST_USE_CUDA)
+;  // NOLINT
+#else
+{
+  common::AssertGPUSupport();
+  return 0;
 }
-
-SparsePageDMatrix::ColPageIter::~ColPageIter() {
-  delete page_;
-}
-
-bool SparsePageDMatrix::ColPageIter::Next() {
-  // doing clock rotation over shards.
-  if (page_ != nullptr) {
-    size_t n = prefetchers_.size();
-    prefetchers_[(clock_ptr_ + n - 1) % n]->Recycle(&page_);
-  }
-  if (prefetchers_[clock_ptr_]->Next(&page_)) {
-    out_.col_index = dmlc::BeginPtr(index_set_);
-    col_data_.resize(page_->offset.size() - 1, SparseBatch::Inst(nullptr, 0));
-    for (size_t i = 0; i < col_data_.size(); ++i) {
-      col_data_[i] = SparseBatch::Inst
-          (dmlc::BeginPtr(page_->data) + page_->offset[i],
-           static_cast<bst_uint>(page_->offset[i + 1] - page_->offset[i]));
-    }
-    out_.col_data = dmlc::BeginPtr(col_data_);
-    out_.size = col_data_.size();
-    // advance clock
-    clock_ptr_ = (clock_ptr_ + 1) % prefetchers_.size();
-    return true;
-  } else {
-    return false;
-  }
-}
-
-void SparsePageDMatrix::ColPageIter::BeforeFirst() {
-  clock_ptr_ = 0;
-  for (auto& p : prefetchers_) {
-    p->BeforeFirst();
-  }
-}
-
-void SparsePageDMatrix::ColPageIter::Init(const std::vector<bst_uint>& index_set,
-                                          bool load_all) {
-  set_index_set_ = index_set;
-  set_load_all_ = load_all;
-  std::sort(set_index_set_.begin(), set_index_set_.end());
-  this->BeforeFirst();
-}
-
-dmlc::DataIter<ColBatch>* SparsePageDMatrix::ColIterator() {
-  CHECK(col_iter_.get() != nullptr);
-  std::vector<bst_uint> col_index;
-  size_t ncol = this->info().num_col;
-  for (size_t i = 0; i < ncol; ++i) {
-    col_index.push_back(static_cast<bst_uint>(i));
-  }
-  col_iter_->Init(col_index, true);
-  return col_iter_.get();
-}
-
-dmlc::DataIter<ColBatch>* SparsePageDMatrix::
-ColIterator(const std::vector<bst_uint>& fset) {
-  CHECK(col_iter_.get() != nullptr);
-  std::vector<bst_uint> col_index;
-  size_t ncol = this->info().num_col;
-  for (size_t i = 0; i < fset.size(); ++i) {
-    if (fset[i] < ncol) {
-      col_index.push_back(fset[i]);
-    }
-  }
-  col_iter_->Init(col_index, false);
-  return col_iter_.get();
-}
-
-
-bool SparsePageDMatrix::TryInitColData() {
-  // load meta data.
-  std::vector<std::string> cache_shards = common::Split(cache_info_, ':');
-  {
-    std::string col_meta_name = cache_shards[0] + ".col.meta";
-    std::unique_ptr<dmlc::Stream> fmeta(
-        dmlc::Stream::Create(col_meta_name.c_str(), "r", true));
-    if (fmeta.get() == nullptr) return false;
-    CHECK(fmeta->Read(&buffered_rowset_)) << "invalid col.meta file";
-    CHECK(fmeta->Read(&col_size_)) << "invalid col.meta file";
-  }
-  // load real data
-  std::vector<std::unique_ptr<dmlc::SeekStream> > files;
-  for (const std::string& prefix : cache_shards) {
-    std::string col_data_name = prefix + ".col.page";
-    std::unique_ptr<dmlc::SeekStream> fdata(
-        dmlc::SeekStream::CreateForRead(col_data_name.c_str(), true));
-    if (fdata.get() == nullptr) return false;
-    files.push_back(std::move(fdata));
-  }
-  col_iter_.reset(new ColPageIter(std::move(files)));
-  return true;
-}
-
-void SparsePageDMatrix::InitColAccess(const std::vector<bool>& enabled,
-                                      float pkeep,
-                                      size_t max_row_perbatch) {
-  if (HaveColAccess()) return;
-  if (TryInitColData()) return;
-
-  const MetaInfo& info = this->info();
-  if (max_row_perbatch == std::numeric_limits<size_t>::max()) {
-    max_row_perbatch = kMaxRowPerBatch;
-  }
-  buffered_rowset_.clear();
-  col_size_.resize(info.num_col);
-  std::fill(col_size_.begin(), col_size_.end(), 0);
-  dmlc::DataIter<RowBatch>* iter = this->RowIterator();
-  std::bernoulli_distribution coin_flip(pkeep);
-  size_t batch_ptr = 0, batch_top = 0;
-  SparsePage tmp;
-  auto& rnd = common::GlobalRandom();
-
-  // function to create the page.
-  auto make_col_batch = [&] (
-      const SparsePage& prow,
-      size_t begin,
-      SparsePage *pcol) {
-    pcol->Clear();
-    pcol->min_index = buffered_rowset_[begin];
-    int nthread;
-    #pragma omp parallel
-    {
-      nthread = omp_get_num_threads();
-      nthread = std::max(nthread, std::max(omp_get_num_procs() / 2 - 1, 1));
-    }
-    common::ParallelGroupBuilder<SparseBatch::Entry>
-    builder(&pcol->offset, &pcol->data);
-    builder.InitBudget(info.num_col, nthread);
-    bst_omp_uint ndata = static_cast<bst_uint>(prow.Size());
-    #pragma omp parallel for schedule(static) num_threads(nthread)
-    for (bst_omp_uint i = 0; i < ndata; ++i) {
-      int tid = omp_get_thread_num();
-      for (size_t j = prow.offset[i]; j < prow.offset[i+1]; ++j) {
-        const SparseBatch::Entry &e = prow.data[j];
-        if (enabled[e.index]) {
-          builder.AddBudget(e.index, tid);
-        }
-      }
-    }
-    builder.InitStorage();
-    #pragma omp parallel for schedule(static) num_threads(nthread)
-    for (bst_omp_uint i = 0; i < ndata; ++i) {
-      int tid = omp_get_thread_num();
-      for (size_t j = prow.offset[i]; j < prow.offset[i+1]; ++j) {
-        const SparseBatch::Entry &e = prow.data[j];
-        builder.Push(e.index,
-                     SparseBatch::Entry(buffered_rowset_[i + begin], e.fvalue),
-                     tid);
-      }
-    }
-    CHECK_EQ(pcol->Size(), info.num_col);
-    // sort columns
-    bst_omp_uint ncol = static_cast<bst_omp_uint>(pcol->Size());
-    #pragma omp parallel for schedule(dynamic, 1) num_threads(nthread)
-    for (bst_omp_uint i = 0; i < ncol; ++i) {
-      if (pcol->offset[i] < pcol->offset[i + 1]) {
-        std::sort(dmlc::BeginPtr(pcol->data) + pcol->offset[i],
-                  dmlc::BeginPtr(pcol->data) + pcol->offset[i + 1],
-                  SparseBatch::Entry::CmpValue);
-      }
-    }
-  };
-
-  auto make_next_col = [&] (SparsePage* dptr) {
-    tmp.Clear();
-    size_t btop = buffered_rowset_.size();
-
-    while (true) {
-      if (batch_ptr != batch_top) {
-        const RowBatch& batch = iter->Value();
-        CHECK_EQ(batch_top, batch.size);
-        for (size_t i = batch_ptr; i < batch_top; ++i) {
-          bst_uint ridx = static_cast<bst_uint>(batch.base_rowid + i);
-          if (pkeep == 1.0f || coin_flip(rnd)) {
-            buffered_rowset_.push_back(ridx);
-            tmp.Push(batch[i]);
-          }
-
-          if (tmp.Size() >= max_row_perbatch ||
-              tmp.MemCostBytes() >= kPageSize) {
-            make_col_batch(tmp, btop, dptr);
-            batch_ptr = i + 1;
-            return true;
-          }
-        }
-        batch_ptr = batch_top;
-      }
-      if (!iter->Next()) break;
-      batch_ptr = 0;
-      batch_top = iter->Value().size;
-    }
-
-    if (tmp.Size() != 0) {
-      make_col_batch(tmp, btop, dptr);
-      return true;
-    } else {
-      return false;
-    }
-  };
-
-  std::vector<std::string> cache_shards = common::Split(cache_info_, ':');
-  std::vector<std::string> name_shards, format_shards;
-  for (const std::string& prefix : cache_shards) {
-    name_shards.push_back(prefix + ".col.page");
-    format_shards.push_back(SparsePage::Format::DecideFormat(prefix).second);
-  }
-
-  {
-    SparsePage::Writer writer(name_shards, format_shards, 6);
-    std::unique_ptr<SparsePage> page;
-    writer.Alloc(&page); page->Clear();
-
-    double tstart = dmlc::GetTime();
-    size_t bytes_write = 0;
-    // print every 4 sec.
-    const double kStep = 4.0;
-    size_t tick_expected = kStep;
-
-    while (make_next_col(page.get())) {
-      for (size_t i = 0; i < page->Size(); ++i) {
-        col_size_[i] += page->offset[i + 1] - page->offset[i];
-      }
-
-      bytes_write += page->MemCostBytes();
-      writer.PushWrite(std::move(page));
-      writer.Alloc(&page);
-      page->Clear();
-
-      double tdiff = dmlc::GetTime() - tstart;
-      if (tdiff >= tick_expected) {
-        LOG(CONSOLE) << "Writing col.page file to " << cache_info_
-                     << " in " << ((bytes_write >> 20UL) / tdiff) << " MB/s, "
-                     << (bytes_write >> 20UL) << " MB writen";
-        tick_expected += kStep;
-      }
-    }
-    // save meta data
-    std::string col_meta_name = cache_shards[0] + ".col.meta";
-    std::unique_ptr<dmlc::Stream> fo(
-        dmlc::Stream::Create(col_meta_name.c_str(), "w"));
-    fo->Write(buffered_rowset_);
-    fo->Write(col_size_);
-    fo.reset(nullptr);
-  }
-  // initialize column data
-  CHECK(TryInitColData());
-}
-
-}  // namespace data
-}  // namespace xgboost
 #endif
+std::size_t NFeaturesDevice(DMatrixProxy *)  // NOLINT
+#if defined(XGBOOST_USE_CUDA)
+;  // NOLINT
+#else
+{
+  common::AssertGPUSupport();
+  return 0;
+}
+#endif
+}  // namespace detail
+
+SparsePageDMatrix::SparsePageDMatrix(DataIterHandle iter_handle, DMatrixHandle proxy_handle,
+                                     DataIterResetCallback *reset, XGDMatrixCallbackNext *next,
+                                     float missing, int32_t nthreads, std::string cache_prefix,
+                                     bool on_host)
+    : proxy_{proxy_handle},
+      iter_{iter_handle},
+      reset_{reset},
+      next_{next},
+      missing_{missing},
+      cache_prefix_{std::move(cache_prefix)},
+      on_host_{on_host} {
+  Context ctx;
+  ctx.nthread = nthreads;
+
+  cache_prefix_ = cache_prefix_.empty() ? "DMatrix" : cache_prefix_;
+  if (collective::IsDistributed()) {
+    cache_prefix_ += ("-r" + std::to_string(collective::GetRank()));
+  }
+  DMatrixProxy *proxy = MakeProxy(proxy_);
+  auto iter = DataIterProxy<DataIterResetCallback, XGDMatrixCallbackNext>{
+      iter_, reset_, next_};
+
+  std::uint32_t n_batches = 0;
+  bst_feature_t n_features = 0;
+  bst_idx_t n_samples = 0;
+  bst_idx_t nnz = 0;
+
+  auto num_rows = [&]() {
+    bool type_error {false};
+    size_t n_samples = HostAdapterDispatch(
+        proxy, [](auto const &value) { return value.NumRows(); }, &type_error);
+    if (type_error) {
+      n_samples = detail::NSamplesDevice(proxy);
+    }
+    return n_samples;
+  };
+  auto num_cols = [&]() {
+    bool type_error {false};
+    bst_feature_t n_features = HostAdapterDispatch(
+        proxy, [](auto const &value) { return value.NumCols(); }, &type_error);
+    if (type_error) {
+      n_features = detail::NFeaturesDevice(proxy);
+    }
+    return n_features;
+  };
+
+  // the proxy is iterated together with the sparse page source so we can obtain all
+  // information in 1 pass.
+  for (auto const &page : this->GetRowBatchesImpl(&ctx)) {
+    this->info_.Extend(std::move(proxy->Info()), false, false);
+    n_features = std::max(n_features, num_cols());
+    n_samples += num_rows();
+    nnz += page.data.Size();
+    n_batches++;
+  }
+
+  iter.Reset();
+
+  this->n_batches_ = n_batches;
+  this->info_.num_row_ = n_samples;
+  this->info_.num_col_ = n_features;
+  this->info_.num_nonzero_ = nnz;
+
+  info_.SynchronizeNumberOfColumns(&ctx);
+  CHECK_NE(info_.num_col_, 0);
+
+  fmat_ctx_ = ctx;
+}
+
+SparsePageDMatrix::~SparsePageDMatrix() {
+  // Clear out all resources before deleting the cache file.
+  sparse_page_source_.reset();
+  std::visit([](auto &&ptr) { ptr.reset(); }, ellpack_page_source_);
+  column_source_.reset();
+  sorted_column_source_.reset();
+  ghist_index_source_.reset();
+
+  for (auto const &kv : cache_info_) {
+    CHECK(kv.second);
+    auto n = kv.second->ShardName();
+    if (kv.second->OnHost()) {
+      continue;
+    }
+    TryDeleteCacheFile(n);
+  }
+}
+
+void SparsePageDMatrix::InitializeSparsePage(Context const *ctx) {
+  auto id = MakeCache(this, ".row.page", false, cache_prefix_, &cache_info_);
+  // Don't use proxy DMatrix once this is already initialized, this allows users to
+  // release the iterator and data.
+  if (cache_info_.at(id)->written) {
+    CHECK(sparse_page_source_);
+    sparse_page_source_->Reset();
+    return;
+  }
+
+  auto iter = DataIterProxy<DataIterResetCallback, XGDMatrixCallbackNext>{iter_, reset_, next_};
+  DMatrixProxy *proxy = MakeProxy(proxy_);
+  sparse_page_source_.reset();  // clear before creating new one to prevent conflicts.
+  sparse_page_source_ = std::make_shared<SparsePageSource>(iter, proxy, this->missing_,
+                                                           ctx->Threads(), this->info_.num_col_,
+                                                           this->n_batches_, cache_info_.at(id));
+}
+
+BatchSet<SparsePage> SparsePageDMatrix::GetRowBatchesImpl(Context const *ctx) {
+  this->InitializeSparsePage(ctx);
+  return BatchSet{BatchIterator<SparsePage>{this->sparse_page_source_}};
+}
+
+BatchSet<SparsePage> SparsePageDMatrix::GetRowBatches() {
+  // Use context from initialization for the default row page.
+  return this->GetRowBatchesImpl(&fmat_ctx_);
+}
+
+BatchSet<CSCPage> SparsePageDMatrix::GetColumnBatches(Context const *ctx) {
+  auto id = MakeCache(this, ".col.page", on_host_, cache_prefix_, &cache_info_);
+  CHECK_NE(this->Info().num_col_, 0);
+  error::NoOnHost(on_host_);
+  this->InitializeSparsePage(ctx);
+  if (!column_source_) {
+    column_source_ =
+        std::make_shared<CSCPageSource>(this->missing_, ctx->Threads(), this->Info().num_col_,
+                                        this->n_batches_, cache_info_.at(id), sparse_page_source_);
+  } else {
+    column_source_->Reset();
+  }
+  return BatchSet{BatchIterator<CSCPage>{this->column_source_}};
+}
+
+BatchSet<SortedCSCPage> SparsePageDMatrix::GetSortedColumnBatches(Context const *ctx) {
+  auto id = MakeCache(this, ".sorted.col.page", on_host_, cache_prefix_, &cache_info_);
+  CHECK_NE(this->Info().num_col_, 0);
+  error::NoOnHost(on_host_);
+  this->InitializeSparsePage(ctx);
+  if (!sorted_column_source_) {
+    sorted_column_source_ = std::make_shared<SortedCSCPageSource>(
+        this->missing_, ctx->Threads(), this->Info().num_col_, this->n_batches_, cache_info_.at(id),
+        sparse_page_source_);
+  } else {
+    sorted_column_source_->Reset();
+  }
+  return BatchSet{BatchIterator<SortedCSCPage>{this->sorted_column_source_}};
+}
+
+BatchSet<GHistIndexMatrix> SparsePageDMatrix::GetGradientIndex(Context const *ctx,
+                                                               const BatchParam &param) {
+  if (param.Initialized()) {
+    CHECK_GE(param.max_bin, 2);
+  }
+  detail::CheckEmpty(batch_param_, param);
+  error::NoOnHost(on_host_);
+  auto id = MakeCache(this, ".gradient_index.page", on_host_, cache_prefix_, &cache_info_);
+  if (!cache_info_.at(id)->written || detail::RegenGHist(batch_param_, param)) {
+    this->InitializeSparsePage(ctx);
+    cache_info_.erase(id);
+    MakeCache(this, ".gradient_index.page", on_host_, cache_prefix_, &cache_info_);
+    LOG(INFO) << "Generating new Gradient Index.";
+    // Use sorted sketch for approx.
+    auto sorted_sketch = param.regen;
+    auto cuts = common::SketchOnDMatrix(ctx, this, param.max_bin, sorted_sketch, param.hess);
+    this->InitializeSparsePage(ctx);  // reset after use.
+
+    batch_param_ = param;
+    ghist_index_source_.reset();
+    CHECK_NE(cuts.Values().size(), 0);
+    auto ft = this->info_.feature_types.ConstHostSpan();
+    ghist_index_source_.reset(new GradientIndexPageSource(
+        this->missing_, ctx->Threads(), this->Info().num_col_, this->n_batches_, cache_info_.at(id),
+        param, std::move(cuts), this->IsDense(), ft, sparse_page_source_));
+  } else {
+    CHECK(ghist_index_source_);
+    ghist_index_source_->Reset();
+  }
+  return BatchSet{BatchIterator<GHistIndexMatrix>{this->ghist_index_source_}};
+}
+
+#if !defined(XGBOOST_USE_CUDA)
+BatchSet<EllpackPage> SparsePageDMatrix::GetEllpackBatches(Context const *, const BatchParam &) {
+  common::AssertGPUSupport();
+  return BatchSet{BatchIterator<EllpackPage>{nullptr}};
+}
+#endif  // !defined(XGBOOST_USE_CUDA)
+}  // namespace xgboost::data

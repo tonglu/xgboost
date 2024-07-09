@@ -11,159 +11,291 @@
 #
 # All configuration values have a default; values that are commented out
 # serve to show the default.
+import os
+import re
+import shutil
+import subprocess
 import sys
-import os, subprocess
-import shlex
+import tarfile
+import urllib.request
+import warnings
+from urllib.error import HTTPError
+
+CURR_PATH = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
+PROJECT_ROOT = os.path.normpath(os.path.join(CURR_PATH, os.path.pardir))
+TMP_DIR = os.path.join(CURR_PATH, "tmp")
+DOX_DIR = "doxygen"
+
+os.environ["XGBOOST_BUILD_DOC"] = "1"
+
+# Version information.
+import xgboost  # NOQA
+
+version = xgboost.__version__
+release = xgboost.__version__
+
+
+def run_doxygen():
+    """Run the doxygen make command in the designated folder."""
+    curdir = os.path.normpath(os.path.abspath(os.path.curdir))
+    if os.path.exists(TMP_DIR):
+        print(f"Delete directory {TMP_DIR}")
+        shutil.rmtree(TMP_DIR)
+    else:
+        print(f"Create directory {TMP_DIR}")
+        os.mkdir(TMP_DIR)
+    try:
+        os.chdir(PROJECT_ROOT)
+        if not os.path.exists(DOX_DIR):
+            os.mkdir(DOX_DIR)
+        os.chdir(os.path.join(PROJECT_ROOT, DOX_DIR))
+        print(
+            "Build doxygen at {}".format(
+                os.path.join(PROJECT_ROOT, DOX_DIR, "doc_doxygen")
+            )
+        )
+        subprocess.check_call(["cmake", "..", "-DBUILD_C_DOC=ON", "-GNinja"])
+        subprocess.check_call(["ninja", "doc_doxygen"])
+
+        src = os.path.join(PROJECT_ROOT, DOX_DIR, "doc_doxygen", "html")
+        dest = os.path.join(TMP_DIR, "dev")
+        print(f"Copy directory {src} -> {dest}")
+        shutil.copytree(src, dest)
+    except OSError as e:
+        sys.stderr.write("doxygen execution failed: %s" % e)
+    finally:
+        os.chdir(curdir)
+
+
+def build_jvm_docs():
+    """Build docs for the JVM packages"""
+    git_branch = os.getenv("READTHEDOCS_VERSION_NAME", default=None)
+    print(f"READTHEDOCS_VERSION_NAME = {git_branch}")
+
+    if not git_branch:
+        git_branch = "master"
+    elif git_branch == "latest":
+        git_branch = "master"
+    elif git_branch == "stable":
+        git_branch = f"release_{xgboost.__version__}"
+    print(f"git_branch = {git_branch}")
+
+    def try_fetch_jvm_doc(branch):
+        """
+        Attempt to fetch JVM docs for a given branch.
+        Returns True if successful
+        """
+        try:
+            url = f"https://s3-us-west-2.amazonaws.com/xgboost-docs/{branch}.tar.bz2"
+            filename, _ = urllib.request.urlretrieve(url)
+            if not os.path.exists(TMP_DIR):
+                print(f"Create directory {TMP_DIR}")
+                os.mkdir(TMP_DIR)
+            jvm_doc_dir = os.path.join(TMP_DIR, "jvm_docs")
+            if os.path.exists(jvm_doc_dir):
+                print(f"Delete directory {jvm_doc_dir}")
+                shutil.rmtree(jvm_doc_dir)
+            print(f"Create directory {jvm_doc_dir}")
+            os.mkdir(jvm_doc_dir)
+
+            with tarfile.open(filename, "r:bz2") as t:
+                t.extractall(jvm_doc_dir)
+            return True
+        except HTTPError:
+            print(f"JVM doc not found at {url}. Skipping...")
+            return False
+
+    if not try_fetch_jvm_doc(git_branch):
+        print(f"Falling back to the master branch...")
+        try_fetch_jvm_doc("master")
+
+
+def is_readthedocs_build():
+    if os.environ.get("READTHEDOCS", None) == "True":
+        return True
+    warnings.warn(
+        "Skipping Doxygen build... You won't have documentation for C/C++ functions. "
+        "Set environment variable READTHEDOCS=True if you want to build Doxygen. "
+        "(If you do opt in, make sure to install Doxygen, Graphviz, CMake, and C++ compiler "
+        "on your system.)"
+    )
+    return False
+
+
+if is_readthedocs_build():
+    run_doxygen()
+    build_jvm_docs()
+
+
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
-curr_path = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
-libpath = os.path.join(curr_path, '../python-package/')
+libpath = os.path.join(PROJECT_ROOT, "python-package/")
 sys.path.insert(0, libpath)
-sys.path.insert(0, curr_path)
-
-from sphinx_util import MarkdownParser, AutoStructify
-
-# -- mock out modules
-import mock
-MOCK_MODULES = ['numpy', 'scipy', 'scipy.sparse', 'sklearn', 'matplotlib', 'pandas', 'graphviz']
-for mod_name in MOCK_MODULES:
-    sys.modules[mod_name] = mock.Mock()
+sys.path.insert(0, CURR_PATH)
 
 # -- General configuration ------------------------------------------------
 
 # General information about the project.
-project = u'xgboost'
-author = u'%s developers' % project
-copyright = u'2016, %s' % author
-github_doc_root = 'https://github.com/dmlc/xgboost/tree/master/doc/'
-
-# add markdown parser
-MarkdownParser.github_doc_root = github_doc_root
-source_parsers = {
-    '.md': MarkdownParser,
-}
-os.environ['XGBOOST_BUILD_DOC'] = '1'
-# Version information.
-import xgboost
-version = xgboost.__version__
-release = xgboost.__version__
+project = "xgboost"
+author = "%s developers" % project
+copyright = "2022, %s" % author
+github_doc_root = "https://github.com/dmlc/xgboost/tree/master/doc/"
 
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom ones
 extensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.napoleon',
-    'sphinx.ext.mathjax',
+    "matplotlib.sphinxext.plot_directive",
+    "sphinxcontrib.jquery",
+    "sphinx.ext.autodoc",
+    "sphinx.ext.napoleon",
+    "sphinx.ext.mathjax",
+    "sphinx.ext.intersphinx",
+    "sphinx_gallery.gen_gallery",
+    "breathe",
+    "myst_parser",
 ]
 
+sphinx_gallery_conf = {
+    # path to your example scripts
+    "examples_dirs": [
+        "../demo/guide-python",
+        "../demo/dask",
+        "../demo/aft_survival",
+        "../demo/gpu_acceleration",
+        "../demo/rmm_plugin",
+    ],
+    # path to where to save gallery generated output
+    "gallery_dirs": [
+        "python/examples",
+        "python/dask-examples",
+        "python/survival-examples",
+        "python/gpu-examples",
+        "python/rmm-examples",
+    ],
+    "matplotlib_animations": True,
+}
+
+autodoc_typehints = "description"
+
+graphviz_output_format = "png"
+plot_formats = [("svg", 300), ("png", 100), ("hires.png", 300)]
+plot_html_show_source_link = False
+plot_html_show_formats = False
+
+# Breathe extension variables
+breathe_projects = {}
+if is_readthedocs_build():
+    breathe_projects = {
+        "xgboost": os.path.join(PROJECT_ROOT, DOX_DIR, "doc_doxygen/xml")
+    }
+breathe_default_project = "xgboost"
+
 # Add any paths that contain templates here, relative to this directory.
-templates_path = ['_templates']
+templates_path = ["_templates"]
 
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
-# source_suffix = ['.rst', '.md']
-source_suffix = ['.rst', '.md']
+source_suffix = [".rst", ".md"]
 
 # The encoding of source files.
-#source_encoding = 'utf-8-sig'
+# source_encoding = 'utf-8-sig'
 
 # The master toctree document.
-master_doc = 'index'
+master_doc = "index"
 
 # The language for content autogenerated by Sphinx. Refer to documentation
 # for a list of supported languages.
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = "en"
+
+autoclass_content = "both"
 
 # There are two options for replacing |today|: either, you set today to some
 # non-false value, then it is used:
-#today = ''
+# today = ''
 # Else, today_fmt is used as the format for a strftime call.
-#today_fmt = '%B %d, %Y'
+# today_fmt = '%B %d, %Y'
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
-exclude_patterns = ['_build']
+exclude_patterns = ["_build"]
+html_extra_path = []
+if is_readthedocs_build():
+    html_extra_path = [TMP_DIR]
 
 # The reST default role (used for this markup: `text`) to use for all
 # documents.
-#default_role = None
+# default_role = None
 
 # If true, '()' will be appended to :func: etc. cross-reference text.
-#add_function_parentheses = True
+# add_function_parentheses = True
 
 # If true, the current module name will be prepended to all description
 # unit titles (such as .. function::).
-#add_module_names = True
+# add_module_names = True
 
 # If true, sectionauthor and moduleauthor directives will be shown in the
 # output. They are ignored by default.
-#show_authors = False
+# show_authors = False
 
 # The name of the Pygments (syntax highlighting) style to use.
-pygments_style = 'sphinx'
+pygments_style = "sphinx"
 
 # A list of ignored prefixes for module index sorting.
-#modindex_common_prefix = []
+# modindex_common_prefix = []
 
 # If true, keep warnings as "system message" paragraphs in the built documents.
-#keep_warnings = False
+# keep_warnings = False
 
 # If true, `todo` and `todoList` produce output, else they produce nothing.
 todo_include_todos = False
 
 # -- Options for HTML output ----------------------------------------------
 
-html_theme_path = ['_static']
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-# html_theme = 'alabaster'
-html_theme = 'xgboost-theme'
+html_theme = "sphinx_rtd_theme"
+html_theme_options = {"logo_only": True}
+
+
+html_logo = "https://xgboost.ai/images/logo/xgboost-logo.png"
+
+html_css_files = ["css/custom.css"]
+
+html_sidebars = {"**": ["logo-text.html", "globaltoc.html", "searchbox.html"]}
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['_static']
+html_static_path = ["_static"]
 
 # Output file base name for HTML help builder.
-htmlhelp_basename = project + 'doc'
+htmlhelp_basename = project + "doc"
 
 # -- Options for LaTeX output ---------------------------------------------
-latex_elements = {
-}
+latex_elements = {}
 
 # Grouping the document tree into LaTeX files. List of tuples
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
-  (master_doc, '%s.tex' % project, project,
-   author, 'manual'),
+    (master_doc, "%s.tex" % project, project, author, "manual"),
 ]
 
-# hook for doxygen
-def run_doxygen(folder):
-    """Run the doxygen make command in the designated folder."""
-    try:
-        retcode = subprocess.call("cd %s; make doxygen" % folder, shell=True)
-        if retcode < 0:
-            sys.stderr.write("doxygen terminated by signal %s" % (-retcode))
-    except OSError as e:
-        sys.stderr.write("doxygen execution failed: %s" % e)
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3.8", None),
+    "numpy": ("https://numpy.org/doc/stable/", None),
+    "scipy": ("https://docs.scipy.org/doc/scipy/", None),
+    "pandas": ("https://pandas.pydata.org/pandas-docs/stable/", None),
+    "sklearn": ("https://scikit-learn.org/stable", None),
+    "dask": ("https://docs.dask.org/en/stable/", None),
+    "distributed": ("https://distributed.dask.org/en/stable/", None),
+    "pyspark": ("https://spark.apache.org/docs/latest/api/python/", None),
+}
 
-def generate_doxygen_xml(app):
-    """Run the doxygen make commands if we're on the ReadTheDocs server"""
-    read_the_docs_build = os.environ.get('READTHEDOCS', None) == 'True'
-    if read_the_docs_build:
-        run_doxygen('..')
 
 def setup(app):
-    # Add hook for building doxygen xml when needed
-    # no c++ API for now
-    # app.connect("builder-inited", generate_doxygen_xml)
-    app.add_config_value('recommonmark_config', {
-            'url_resolver': lambda url: github_doc_root + url,
-            }, True)
-    app.add_transform(AutoStructify)
+    app.add_css_file("custom.css")

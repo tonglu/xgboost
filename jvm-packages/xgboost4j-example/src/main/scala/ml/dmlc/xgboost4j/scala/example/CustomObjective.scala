@@ -32,7 +32,7 @@ import org.apache.commons.logging.{LogFactory, Log}
  * function
  *
  */
-class CustomObjective {
+object CustomObjective {
 
   /**
    * loglikelihoode loss obj function
@@ -57,7 +57,7 @@ class CustomObjective {
         case e: XGBoostError =>
           logger.error(e)
           null
-        case _ =>
+        case _: Throwable =>
           null
       }
       val grad = new Array[Float](nrow)
@@ -138,8 +138,8 @@ class CustomObjective {
   }
 
   def main(args: Array[String]): Unit = {
-    val trainMat = new DMatrix("../../demo/data/agaricus.txt.train")
-    val testMat = new DMatrix("../../demo/data/agaricus.txt.test")
+    val trainMat = new DMatrix("../../demo/data/agaricus.txt.train?format=libsvm")
+    val testMat = new DMatrix("../../demo/data/agaricus.txt.test?format=libsvm")
     val params = new mutable.HashMap[String, Any]()
     params += "eta" -> 1.0
     params += "max_depth" -> 2
@@ -151,7 +151,8 @@ class CustomObjective {
     val round = 2
     // train a model
     val booster = XGBoost.train(trainMat, params.toMap, round, watches.toMap)
-    XGBoost.train(trainMat, params.toMap, round, watches.toMap, new LogRegObj, new EvalError)
+    XGBoost.train(trainMat, params.toMap, round, watches.toMap,
+      obj = new LogRegObj, eval = new EvalError)
   }
 
 }
